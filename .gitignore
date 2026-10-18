@@ -1,0 +1,30 @@
+# Parsec's own binaries and anything derived from them are NOT redistributed here.
+# You need to supply your own copy from your own Parsec installation.
+re/*
+!re/NOTES.md
+
+# IDA databases, crash dumps
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.dmp
+ida-backup/
+
+# Captures and credentials — these contain session keys, and a capture can contain
+# the peer's clipboard contents.
+*.log
+client_init.json
+creds.json
+session.json
+device_id
+portal_token
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
