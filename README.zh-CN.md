@@ -45,20 +45,25 @@ Wayland 合成器理论上都能用：抓屏只需要 ScreenCast portal，输入
   帧头里。
 - 任意桌面分辨率，包括推流过程中改变分辨率：编码尺寸在抓屏启动时固定，所以改变窗口大小不会
   重建编码器，也不会断开连接
-- **鼠标和键盘输入**，通过 `uinput` 创建一个绝对坐标指针设备和一个键盘设备来注入
+- **鼠标、键盘和滚轮**，通过 `uinput` 创建一个绝对坐标指针设备和一个键盘设备来注入。
+  滚轮是高精度的：客户端发送的是 Windows 滚轮单位（每格 120），正好一一对应 Linux 的
+  `REL_WHEEL_HI_RES`，所以平滑滚动依然平滑。
+- **音频**：通过 PipeWire 抓取桌面正在播放的声音，编码为 Opus，48 kHz 立体声、20 毫秒
+  一帧——和 Parsec 官方被控端发送的格式一致
+- **客户端请求的分辨率。** 客户端要求某个分辨率时，桌面会切换到显示器支持的最接近的
+  模式，推流以新尺寸重新开始；客户端选择"保持被控端分辨率"或断开连接时，恢复原来的
+  分辨率。需要 GNOME（Mutter 的显示配置接口）。
+- **检测客户端已断开**：5 秒收不到任何数据包就结束推流（不再空跑编码），并恢复分辨率
 
 ## 尚未实现
 
-- **滚轮和手柄**：消息能解析，但字段布局是从 SDK 的枚举推算出来的，没有在实际流量里观察到。
-  `parsec4linux/input.py` 会标记哪些消息是已确认的，被控端遇到推测布局时会打日志，所以猜错
-  会暴露出来，而不是悄悄注入错误的输入。
-- **客户端请求分辨率。** 客户端可以要求被控端改变屏幕分辨率（配置消息里的 `resolutionX` /
-  `resolutionY`），我们忽略了它。因此连接过程中改变桌面分辨率不会重新选择编码尺寸，要重启
-  被控端才会生效。
-- **检测客户端已断开。** 被控端会一直推流到运行时间结束；Parsec 官方被控端在 60 秒收不到
-  任何数据包后就会放弃。
-- 音频 —— 通道 2，消息类型 `0x01`
-- 鼠标指针形状（客户端始终显示普通箭头）、剪贴板、多客户端
+- **手柄**：消息是根据 SDK 的定义解析的，从没在实际流量里见过，也还没有创建虚拟手柄
+  （`uinput` 可以做到，就像现在的鼠标和键盘）
+- 连接过程中拖动改变虚拟机窗口大小，要到下一次连接才会重新选择编码尺寸（客户端*请求*的
+  分辨率则会立即生效）
+- 鼠标指针形状（客户端始终显示普通箭头）、剪贴板、麦克风、多客户端
+- **硬件编码。** 全部在 CPU 上运行。4 核虚拟机在 Firefox 里播放视频的同时滚动页面，CPU
+  会耗尽：帧率下降，声音出现断续。解决办法是给虚拟机更多核心；Parsec 官方是用 GPU 编码的。
 
 ## 文件结构
 
@@ -70,9 +75,12 @@ Wayland 合成器理论上都能用：抓屏只需要 ScreenCast portal，输入
 | `parsec4linux/app.py` | 13 字节控制消息头 |
 | `parsec4linux/video.py` | 10 字节视频帧头、关键帧判定、编码尺寸选择 |
 | `parsec4linux/input.py` | 客户端到被控端的输入消息、Parsec 到 Linux 的键码映射 |
+| `parsec4linux/audio.py` | 15 字节的音频消息头 |
 | `tools/kessel_probe.py` | 被控端主程序：信令、ICE、BUD、发送视频 |
 | `tools/capture_h264.py` | 抓屏 + 编码（PipeWire portal 或测试图案） |
 | `tools/inject_input.py` | 通过 `/dev/uinput` 把输入注入桌面 |
+| `tools/capture_audio.py` | 桌面声音 → Opus |
+| `tools/display_mode.py` | 切换并恢复桌面分辨率（GNOME） |
 | `tools/parsec_client.py` | 一个客户端，连到真实被控端并解密它的流量 |
 | `tools/validate_capture.py` | 把抓包重放过一遍封装逻辑做校验 |
 | `tools/retransmit_stats.py` | 从抓包统计重传情况 |
@@ -94,7 +102,8 @@ Wayland 合成器理论上都能用：抓屏只需要 ScreenCast portal，输入
 - 一个 **Parsec 账号**，被控端要登录 Parsec 自己的服务器才能被列出来
 - 你**连出去**的那台机器上装有普通的 **Parsec 客户端**
 - Python 3.12+、`websockets`、`cryptography`
-- `gstreamer1.0-plugins-{good,bad,ugly}`，提供 `x264enc` / `h264parse`
+- `gstreamer1.0-plugins-{base,good,bad,ugly}`，提供 `x264enc`、`h264parse`、`opusenc`
+  和 `pulsesrc`
 - 输入功能需要 `/dev/uinput` 的写权限：
   ```sh
   sudo setfacl -m u:$USER:rw /dev/uinput          # 重启前有效
@@ -112,8 +121,10 @@ python tools/kessel_probe.py auth
 python tools/kessel_probe.py ws --answer --port 8000 --fps 30 \
     --name my-linux-host \
     --inject "python3 tools/inject_input.py --desktop 2554x1367" \
-    --capture "python3 tools/capture_h264.py --source pipewire \
-               --fps 30 --keyint 30 --bitrate 3000"
+    --audio "python3 tools/capture_audio.py" \
+    --resolution-cmd "python3 tools/display_mode.py" \
+    --capture "nice -n 10 python3 tools/capture_h264.py --source pipewire \
+               --cursor hidden --fps 30 --keyint 30 --bitrate 3000"
 ```
 
 然后用任意 Parsec 客户端连接 `my-linux-host`。
@@ -124,7 +135,10 @@ python tools/kessel_probe.py ws --answer --port 8000 --fps 30 \
   `--native-off` 可以退回到以前那种固定 `--width`×`--height` 的行为。
 - `--desktop WxH` 要填你真实的桌面分辨率。它把绝对坐标轴的范围声明成屏幕尺寸，让合成器
   1:1 映射，这样注入的指针才能和客户端自己画的指针对齐。
-- 不想接受输入，就去掉 `--inject`。
+- 不想接受输入，就去掉 `--inject`；不要声音就去掉 `--audio`；去掉 `--resolution-cmd`
+  则忽略分辨率请求（只记录到日志）。
+- `nice -n 10` 让编码器以较低优先级运行。负载高的时候应该让编码器等待，而不是让音频抓取
+  或被控端本身等待。
 - 抓屏必须用系统的 `python3`，因为它需要 `gi`（PyGObject），虚拟环境里一般没有；被控端本身
   可以跑在 venv 里。
 - `python3 tools/inject_input.py --selftest` 可以在不连客户端的情况下单独测试输入注入——它会

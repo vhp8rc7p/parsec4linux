@@ -50,23 +50,31 @@ a ScreenCast portal and input only needs `/dev/uinput`. Untested.
 - any desktop size, including resizing it while streaming: the encode size is pinned
   when capture starts, so a resize never reinitialises the encoder or drops the
   connection
-- **mouse and keyboard input**, injected via `uinput` as an absolute pointer plus a
-  keyboard device
+- **mouse, keyboard and scroll wheel**, injected via `uinput` as an absolute pointer
+  plus a keyboard device. Scrolling is high-resolution: the client sends Windows wheel
+  units (120 per notch), which map 1:1 onto Linux's `REL_WHEEL_HI_RES`, so smooth
+  scrolling stays smooth.
+- **audio**: the desktop's output is captured through PipeWire and sent as Opus,
+  48 kHz stereo, 20 ms frames — the same format Parsec's own host sends
+- **client-requested resolution.** If the client asks for a resolution, the desktop
+  switches to the nearest mode the display offers and the stream restarts at the new
+  size; the original resolution comes back when the client asks for "keep host
+  resolution" or disconnects. Needs GNOME (Mutter's display API).
+- **noticing that the client left**: 5 s without a packet ends the stream (no encoding
+  for nobody) and restores the resolution
 
 ## Not implemented yet
 
-- **scroll wheel and gamepad**: decoded, but their field layouts are inferred from the
-  SDK enum rather than observed on the wire. `parsec4linux/input.py` records which
-  messages are confirmed, and the host logs any inferred layout it meets, so a wrong
-  guess shows up instead of silently mis-injecting.
-- **client-requested resolution.** The client can ask the host to change its screen
-  resolution (`resolutionX`/`resolutionY` in its config message); we ignore it. A
-  consequence: resizing the desktop mid-session doesn't re-pick the encode size until
-  the host is restarted.
-- **noticing that the client left.** The host keeps streaming until its run time ends;
-  Parsec's own gives up after 60 s without a packet.
-- audio — channel 2, message type `0x01`
-- cursor shape (the client always shows a plain arrow), clipboard, multiple clients
+- **gamepads**: the messages are decoded from the SDK's definitions but have never been
+  seen on the wire, and nothing creates a virtual controller yet (`uinput` can, the way
+  it already does mouse and keyboard)
+- resizing the VM window mid-session doesn't re-pick the encode size until the next
+  connection (a client *request* does)
+- cursor shape (the client always shows a plain arrow), clipboard, microphone,
+  multiple clients
+- **hardware encoding.** Everything runs on the CPU. A 4-core VM playing a video in
+  Firefox while the page scrolls runs out of CPU: the frame rate drops and audio gaps
+  appear. More cores is the fix; Parsec itself encodes on the GPU.
 
 ## Layout
 
@@ -78,9 +86,12 @@ a ScreenCast portal and input only needs `/dev/uinput`. Untested.
 | `parsec4linux/app.py` | 13-byte control-message header |
 | `parsec4linux/video.py` | 10-byte video header, keyframe detection, encode sizing |
 | `parsec4linux/input.py` | client→host input messages, Parsec→Linux keycodes |
+| `parsec4linux/audio.py` | the 15-byte audio header |
 | `tools/kessel_probe.py` | the host: signaling, ICE, BUD, video send |
 | `tools/capture_h264.py` | capture + encode (PipeWire portal or a test pattern) |
 | `tools/inject_input.py` | injects input into the desktop via `/dev/uinput` |
+| `tools/capture_audio.py` | desktop audio → Opus |
+| `tools/display_mode.py` | switches and restores the desktop resolution (GNOME) |
 | `tools/parsec_client.py` | a client that connects to a real host and decrypts it |
 | `tools/validate_capture.py` | replays a capture through the framing to check it |
 | `tools/retransmit_stats.py` | quantifies retransmission from a capture |
@@ -103,7 +114,8 @@ never loads any Parsec code — it speaks the protocol over the network. What yo
 - a **Parsec account**, since the host signs in to Parsec's own servers to be listed
 - the normal **Parsec client** on whatever machine you connect *from*
 - Python 3.12+, `websockets`, `cryptography`
-- `gstreamer1.0-plugins-{good,bad,ugly}` for `x264enc` / `h264parse`
+- `gstreamer1.0-plugins-{base,good,bad,ugly}` for `x264enc`, `h264parse`, `opusenc`
+  and `pulsesrc`
 - for input, write access to `/dev/uinput`:
   ```sh
   sudo setfacl -m u:$USER:rw /dev/uinput          # until reboot
@@ -121,8 +133,10 @@ python tools/kessel_probe.py auth
 python tools/kessel_probe.py ws --answer --port 8000 --fps 30 \
     --name my-linux-host \
     --inject "python3 tools/inject_input.py --desktop 2554x1367" \
-    --capture "python3 tools/capture_h264.py --source pipewire \
-               --fps 30 --keyint 30 --bitrate 3000"
+    --audio "python3 tools/capture_audio.py" \
+    --resolution-cmd "python3 tools/display_mode.py" \
+    --capture "nice -n 10 python3 tools/capture_h264.py --source pipewire \
+               --cursor hidden --fps 30 --keyint 30 --bitrate 3000"
 ```
 
 Then connect to `my-linux-host` from any Parsec client.
@@ -135,7 +149,10 @@ Notes on the invocation:
 - `--desktop WxH` should be your real desktop size. It makes the injected cursor line up
   with the client's own cursor, by declaring the absolute axes at the screen's size so
   the compositor maps them 1:1.
-- Drop `--inject` to stream without accepting input.
+- Drop `--inject` to stream without accepting input, `--audio` to stream silently,
+  `--resolution-cmd` to ignore resolution requests (they are then only logged).
+- `nice -n 10` runs the encoder at a lower priority than everything else. Under load it
+  is the encoder that should wait, not audio capture or the host itself.
 - The capture runs under the system `python3` because it needs `gi` (PyGObject), which a
   venv typically lacks; the host itself can run in a venv.
 - `python3 tools/inject_input.py --selftest` checks input injection on its own, with no

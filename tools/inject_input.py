@@ -51,6 +51,10 @@ UI_SET_ABSBIT = 0x40045567
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
 SYN_REPORT = 0
 REL_HWHEEL, REL_WHEEL = 0x06, 0x08
+# 1/120-notch axes (kernel 5.0+). Same unit as Windows mouseData, which is what
+# the client sends, so no conversion is needed -- only the notch count derived.
+REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES = 0x0b, 0x0c
+WHEEL_DELTA = 120
 ABS_X, ABS_Y = 0x00, 0x01
 ABS_CNT = 64
 
@@ -134,17 +138,19 @@ class InputSink:
             self.pointer = UinputDevice(
                 "parsec4linux pointer",
                 keys=pinput.ALL_LINUX_BUTTONS,
-                rels=(0, 1, REL_WHEEL, REL_HWHEEL))  # REL_X, REL_Y
+                rels=(0, 1, REL_WHEEL, REL_HWHEEL,  # REL_X, REL_Y
+                      REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES))
             self._last = None
         else:
             self.pointer = UinputDevice(
                 "parsec4linux pointer",
                 keys=pinput.ALL_LINUX_BUTTONS,
-                rels=(REL_WHEEL, REL_HWHEEL),
+                rels=(REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES),
                 abs_axes=((ABS_X, 0, w - 1), (ABS_Y, 0, h - 1)))
         self.keyboard = UinputDevice("parsec4linux keyboard",
                                      keys=pinput.ALL_LINUX_KEYS)
         self.unmapped: set[int] = set()
+        self._wheel_acc = [0, 0]  # partial notches, [horizontal, vertical]
 
     def motion(self, x: int, y: int, rel: bool = False) -> None:
         if rel or self.relative:
@@ -185,11 +191,24 @@ class InputSink:
         self.pointer.sync()
 
     def wheel(self, x: int, y: int) -> None:
-        # Parsec sends pixel-ish deltas; evdev REL_WHEEL counts detents.
-        if y:
-            self.pointer.emit(EV_REL, REL_WHEEL, 1 if y > 0 else -1)
-        if x:
-            self.pointer.emit(EV_REL, REL_HWHEEL, 1 if x > 0 else -1)
+        # Units are Windows mouseData: 120 per notch, smaller for smooth-scrolling
+        # devices. The DLL's injector (0x18007E230, case 2) passes them straight to
+        # SendInput: field1 as MOUSEEVENTF_WHEEL, field0 as MOUSEEVENTF_HWHEEL. Signs
+        # agree with evdev (positive = up / right).
+        #
+        # Emit the hi-res axis with the value as-is -- libinput scrolls smoothly from
+        # it -- and the legacy notch axis once a whole notch has accumulated, for
+        # clients that only read REL_WHEEL. The kernel's own hi-res mice do the same.
+        for value, hi, lo, idx in ((y, REL_WHEEL_HI_RES, REL_WHEEL, 1),
+                                   (x, REL_HWHEEL_HI_RES, REL_HWHEEL, 0)):
+            if not value:
+                continue
+            self.pointer.emit(EV_REL, hi, value)
+            self._wheel_acc[idx] += value
+            notches = int(self._wheel_acc[idx] / WHEEL_DELTA)  # toward zero
+            if notches:
+                self.pointer.emit(EV_REL, lo, notches)
+                self._wheel_acc[idx] -= notches * WHEEL_DELTA
         if x or y:
             self.pointer.sync()
 

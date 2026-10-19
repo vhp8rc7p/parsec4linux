@@ -29,7 +29,7 @@ import websockets
 import stun
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
-from parsec4linux import app, bud, feedback, reliable, video  # noqa: E402
+from parsec4linux import audio as paudio, app, bud, feedback, reliable, video  # noqa: E402
 from parsec4linux import input as pinput  # noqa: E402
 
 # bud_thread emits feedback every 30 ms (DLL 0x18003CC60: `>= 30.0`).
@@ -62,6 +62,17 @@ VIDEO_FLAGS_FIRST = 0x61
 VIDEO_FLAGS = 0x10
 CAPTURE_CMD = None
 INJECT_CMD = None
+# tools/display_mode.py, to honour the resolution a client asks for. None = log only.
+RESOLUTION_CMD = None
+# tools/capture_audio.py: Opus packets, one record each. None = no audio.
+AUDIO_CMD = None
+# A connected client acks every 30 ms, so this much silence means it has gone. There
+# is no goodbye message in BUD or signaling; the DLL's own hard limit is 60 s
+# (bud_thread, -12007), far too slow to give the desktop its resolution back.
+CLIENT_TIMEOUT = 5.0
+# res_requested before any 0x0b has arrived -- distinct from None ("keep the
+# host's resolution"), which still owes a restore if we changed it earlier.
+NO_CONFIG = object()
 
 # Retransmission (DLL 0x18003C380). We have no RTT measurement yet, so assume a LAN-ish
 # value; the RTO floor of 50 ms dominates anyway.
@@ -277,6 +288,12 @@ class UdpLogger(asyncio.DatagramProtocol):
         self.reassembler = reliable.Reassembler()
         self.feedback_task = None
         self.video_task = None
+        self.audio_task = None
+        self.audio_packets = 0
+        self._audio_last = None
+        self.audio_max_gap = 0.0  # ms, per log line
+        self.audio_late = 0         # packets > 60 ms after the previous one
+        self._cpu_prev = None
         self.peer = None
         self._msg_seq = {}  # app channel -> next message sequence number
         self.unacked = collections.defaultdict(dict)  # channel -> {seq: (frame, sent, retx)}
@@ -296,7 +313,14 @@ class UdpLogger(asyncio.DatagramProtocol):
         self.timer_acks = 0          # type 0x08
         self.msg_acks_sent = 0       # 0x02s WE sent: the client's only RTT source
         self.enc_ms = None           # smoothed capture -> encoded, for the log
+        self.frames_sent = 0         # paces the 0x15 encode heartbeat
         self.frame_interval_ms = 0.0
+        self.last_rx = None          # monotonic time of the last BUD packet
+        self.watchdog_task = None
+        self.capture_proc = None
+        self._capture_restart = False
+        self.res_applied = False     # we changed the desktop mode and owe a restore
+        self.res_requested = NO_CONFIG  # (w, h), None = keep, or none yet
 
     def reset_session(self):
         """Drop the session so the next datagram rebuilds it from the new attempt's creds.
@@ -304,10 +328,11 @@ class UdpLogger(asyncio.DatagramProtocol):
         Each reconnect carries fresh aes256/ice creds, so a session pinned to the old
         attempt can neither decrypt the new client nor be decrypted by it.
         """
-        for task in (self.feedback_task, self.video_task):
+        for task in (self.feedback_task, self.video_task, self.audio_task):
             if task is not None:
                 task.cancel()
-        self.feedback_task = self.video_task = None
+        self.feedback_task = self.video_task = self.audio_task = None
+        self.audio_packets = 0
         self.session = None
         self.peer = None
         self.checked = set()
@@ -323,9 +348,14 @@ class UdpLogger(asyncio.DatagramProtocol):
         self.imm_acks = self.timer_acks = 0
         self.msg_acks_sent = 0
         self.enc_ms = None
+        self.frames_sent = 0
         self.late = 0
         self.acks = feedback.AckTracker()
         self.reassembler = reliable.Reassembler()
+        self.last_rx = None
+        self.capture_proc = None
+        self._capture_restart = False
+        self.res_requested = NO_CONFIG  # next client states its own; res_applied stays
         print("   session reset for new attempt")
 
     def _ensure_session(self, addr):
@@ -346,12 +376,17 @@ class UdpLogger(asyncio.DatagramProtocol):
         print(f"  (tx key = {TX_KEY})")
         if VIDEO_FRAME is not None or CAPTURE_CMD:
             self.video_task = asyncio.get_running_loop().create_task(self._video_loop())
+        if AUDIO_CMD:
+            self.audio_task = asyncio.get_running_loop().create_task(self._audio_loop())
         if INJECT_CMD and self.inject is None:
             # Started once and kept across reconnects: recreating the uinput devices
             # would make the compositor re-probe them on every attempt.
             asyncio.get_running_loop().create_task(self._start_inject())
         self.peer = addr
+        self.last_rx = time.monotonic()
         self.feedback_task = asyncio.get_running_loop().create_task(self._feedback_loop())
+        if self.watchdog_task is None:
+            self.watchdog_task = asyncio.get_running_loop().create_task(self._watchdog())
         print(f"BUD session up with {addr[0]}:{addr[1]}; feedback every "
               f"{FEEDBACK_INTERVAL * 1000:.0f} ms")
 
@@ -509,8 +544,27 @@ class UdpLogger(asyncio.DatagramProtocol):
                 print(f"   input: {self.input_seen}{extent}")
             if self.enc_ms is not None:
                 print(f"   encode={self.enc_ms:.1f}ms (smoothed) interval="
-                      f"{self.frame_interval_ms:.1f}ms msg_acks_sent={self.msg_acks_sent}")
+                      f"{self.frame_interval_ms:.1f}ms msg_acks_sent={self.msg_acks_sent} "
+                      f"audio_packets={self.audio_packets} audio_late={self.audio_late} "
+                      f"audio_max_gap={self.audio_max_gap:.0f}ms cpu_idle={self._cpu_idle()}")
+                self.audio_max_gap = 0.0
         return True
+
+    def _cpu_idle(self):
+        """Whole-VM idle % since the last call, from /proc/stat ("?" elsewhere).
+
+        The quickest way to tell a starved machine from a congested network.
+        """
+        try:
+            with open("/proc/stat") as f:
+                vals = [int(v) for v in f.readline().split()[1:]]
+        except OSError:
+            return "?"
+        idle, total = vals[3] + vals[4], sum(vals)
+        prev, self._cpu_prev = self._cpu_prev, (idle, total)
+        if prev is None or total == prev[1]:
+            return "?"
+        return f"{100 * (idle - prev[0]) / (total - prev[1]):.0f}%"
 
     def _send_frame_stats(self, encode_ms, interval_ms):
         """0x22 after each sent frame -- what the client HUD's "Encode" reads.
@@ -527,6 +581,13 @@ class UdpLogger(asyncio.DatagramProtocol):
                        else 0.9 * self.enc_ms + 0.1 * encode_ms)
         self._send_message(app.CONTROL_CHANNEL,
                            app.frame_stats(0, encode_ms, 0.0, encode_ms, interval_ms))
+        # The HUD's "Encode" comes from THIS, not from 0x22 (which only feeds the
+        # client's graph history): every 30 frames, the smoothed encode time in us,
+        # exactly as the DLL sends it (lrint(ewma_ms * 1000.0)).
+        self.frames_sent += 1
+        if self.frames_sent % 30 == 0:
+            self._send_message(app.CONTROL_CHANNEL,
+                               app.heartbeat(round(self.enc_ms * 1000), 0))
 
     async def _video_loop(self):
         """Send video on channel 1, after a 0x1D stream-init on channel 0.
@@ -535,16 +596,83 @@ class UdpLogger(asyncio.DatagramProtocol):
         bugs) or streams live frames from tools/capture_h264.py (--capture).
         """
         await asyncio.sleep(0.2)  # let the client finish its own init burst
-        try:
-            n = self._send_message(app.CONTROL_CHANNEL, app.stream_init(0, 0))
-            print(f">> control 0x1D stream_init ({n} fragment(s))")
-        except Exception as e:
-            print("stream_init failed:", e)
-            return
-        if CAPTURE_CMD:
+        while True:
+            # 0x1D goes out whenever the encoder (re)starts -- the DLL sends it on the
+            # first frame after encode init -- so a capture restarted at a new
+            # resolution is announced the same way as the first one.
+            try:
+                n = self._send_message(app.CONTROL_CHANNEL, app.stream_init(0, 0))
+                print(f">> control 0x1D stream_init ({n} fragment(s))")
+            except Exception as e:
+                print("stream_init failed:", e)
+                return
+            if not CAPTURE_CMD:
+                await self._replay_static()
+                return
             await self._stream_capture()
-        else:
-            await self._replay_static()
+            if not self._capture_restart or self.session is None:
+                return
+            self._capture_restart = False
+            old = self.capture_proc
+            if old is not None:  # let the old portal session close before opening one
+                try:
+                    await asyncio.wait_for(old.wait(), 3.0)
+                except TimeoutError:
+                    old.kill()
+            print(">> capture restarting (desktop resolution changed)")
+
+    async def _audio_loop(self):
+        """Stream Opus packets from tools/capture_audio.py on app channel 2.
+
+        Record: [u32 le length][one Opus packet], 20 ms of 48 kHz stereo each. Each one
+        becomes a message with the 15-byte audio header (parsec4linux/audio.py), plus
+        nothing else: see audio.py on why the audio heartbeat is not sent.
+        """
+        await asyncio.sleep(0.2)  # same settling delay as video
+        proc = await asyncio.create_subprocess_exec(
+            *AUDIO_CMD, stdout=asyncio.subprocess.PIPE, stderr=None)
+        print(">> audio started:", " ".join(AUDIO_CMD))
+        try:
+            while True:
+                (size,) = struct.unpack("<I", await proc.stdout.readexactly(4))
+                if size > 1 << 20:
+                    print("audio: implausible packet size", size)
+                    return
+                packet = await proc.stdout.readexactly(size)
+                # Gaps between packets as WE see them: a capture that is fine (no
+                # "capture lost" line) but arrives here late means this process was
+                # starved, not the capture.
+                now = time.monotonic()
+                if self._audio_last is not None:
+                    gap = (now - self._audio_last) * 1000
+                    self.audio_max_gap = max(self.audio_max_gap, gap)
+                    if gap > 60:
+                        self.audio_late += 1
+                self._audio_last = now
+                if self.session is None or self.peer is None:
+                    continue
+                self._send_message(paudio.CHANNEL, paudio.build_message(packet))
+                self.audio_packets += 1
+        except asyncio.IncompleteReadError:
+            print("audio ended")
+        except Exception as e:
+            print("audio capture/send failed:", e)
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+
+    def _restart_capture(self):
+        """End the running capture so _video_loop starts a fresh one.
+
+        The capture pins its encode size at startup, so a new desktop resolution needs
+        a new capture to be encoded natively rather than scaled to the old size. The
+        portal's restore token is reused, so this does not prompt again.
+        """
+        proc = self.capture_proc
+        if proc is None or proc.returncode is not None:
+            return
+        self._capture_restart = True
+        proc.terminate()
 
     async def _replay_static(self):
         interval = 1.0 / max(1, VIDEO_FPS)
@@ -572,6 +700,7 @@ class UdpLogger(asyncio.DatagramProtocol):
         """
         proc = await asyncio.create_subprocess_exec(
             *CAPTURE_CMD, stdout=asyncio.subprocess.PIPE, stderr=None)
+        self.capture_proc = proc
         print(">> capture started:", " ".join(CAPTURE_CMD))
         frame_no = 0
         last_frame_at = None
@@ -615,6 +744,9 @@ class UdpLogger(asyncio.DatagramProtocol):
         """Route a reassembled app message. Input goes to the uinput child."""
         if len(payload) < app.HEADER_LEN:
             return
+        if payload[app.HEADER_LEN - 1] == app.TYPE_CONFIG:
+            self._on_client_config(payload)
+            return
         ev = pinput.decode(payload)
         if ev is None:
             return  # control message; logged by the caller
@@ -641,6 +773,92 @@ class UdpLogger(asyncio.DatagramProtocol):
         if line is None:
             return
         self._inject_send(line)
+
+    def _on_client_config(self, payload):
+        """0x0b: the client's config JSON, sent on connect and again when it changes.
+
+        Parsed host-side by 0x1800A5400. `resolutionX`/`resolutionY` is what the client
+        wants the host desktop to be; 0 (and 0xFFFF) mean "leave it", which on Windows
+        restores the original mode. `resolutions` repeats it per stream for multiple
+        monitors; only stream 0 exists here.
+        """
+        hdr = app.parse(payload)
+        body = payload[app.HEADER_LEN:app.HEADER_LEN + hdr["field0"]] or \
+            payload[app.HEADER_LEN:]
+        try:
+            cfg = json.loads(body.rstrip(b"\0").decode())
+        except ValueError as e:
+            print(f"   0x0b config not JSON ({e}): {body[:80]!r}")
+            return
+        w, h = int(cfg.get("resolutionX") or 0), int(cfg.get("resolutionY") or 0)
+        if not (w and h) and cfg.get("resolutions"):
+            first = cfg["resolutions"][0]
+            w, h = int(first.get("width") or 0), int(first.get("height") or 0)
+        fps = int(cfg.get("refreshRate") or 60)
+        print(f"<< client config: resolution {w}x{h} @ {fps} "
+              f"(raw {json.dumps({k: cfg.get(k) for k in ('resolutionX', 'resolutionY', 'refreshRate', 'resolutions')})})")
+        keep = not (w and h) or 0xFFFF in (w, h)
+        want = None if keep else (w, h)
+        if want == self.res_requested:
+            return
+        self.res_requested = want
+        if RESOLUTION_CMD is None:
+            print("   (no --resolution-cmd: request logged, desktop left alone)")
+            return
+        if keep:
+            if self.res_applied:
+                asyncio.get_running_loop().create_task(self._restore_resolution())
+            return
+        asyncio.get_running_loop().create_task(self._set_resolution(w, h, fps))
+
+    async def _run_display_cmd(self, *args):
+        proc = await asyncio.create_subprocess_exec(
+            *RESOLUTION_CMD, *args, stdout=asyncio.subprocess.PIPE)
+        out, _ = await proc.communicate()
+        try:
+            return json.loads(out.decode().strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return {"ok": False, "error": f"no JSON from display helper: {out[:200]!r}"}
+
+    async def _set_resolution(self, w, h, fps):
+        res = await self._run_display_cmd("set", f"{w}x{h}", "--fps", str(fps))
+        if not res.get("ok"):
+            print(f"!! resolution {w}x{h} not applied: {res.get('error')}")
+            return
+        self.res_applied = True
+        print(f">> desktop resolution: asked {w}x{h}, set {res['mode']}"
+              f"{'' if res.get('changed') else ' (already current)'}")
+        if res.get("changed"):
+            await asyncio.sleep(0.5)  # let the compositor settle before re-capturing
+            self._restart_capture()
+
+    async def _restore_resolution(self):
+        res = await self._run_display_cmd("restore")
+        if not res.get("ok"):
+            print(f"!! resolution restore failed: {res.get('error')}")
+            return
+        self.res_applied = False
+        if res.get("changed"):
+            print(f">> desktop resolution restored to {res['mode']}")
+            self._restart_capture()
+
+    async def _watchdog(self):
+        """Notice a client that has gone, and give the desktop back.
+
+        Ends the stream (no more encoding for nobody) and restores the resolution if
+        the client had changed it.
+        """
+        while True:
+            await asyncio.sleep(1.0)
+            if self.session is None or self.last_rx is None:
+                continue
+            silent = time.monotonic() - self.last_rx
+            if silent < CLIENT_TIMEOUT:
+                continue
+            print(f"!! client silent for {silent:.1f} s: treating it as disconnected")
+            self.reset_session()
+            if self.res_applied and RESOLUTION_CMD is not None:
+                await self._restore_resolution()
 
     def _inject_send(self, line):
         """Write one JSON event to the injector child, if one is running."""
@@ -690,6 +908,7 @@ class UdpLogger(asyncio.DatagramProtocol):
         except Exception as e:
             print(f"BUD << decrypt failed ({e}); wrong key/direction?")
             return
+        self.last_rx = time.monotonic()
         msg_type, channel = pt[1], pt[2]
         seq = int.from_bytes(pt[3:7], "big")
         if feedback.is_ack_packet(pt):
@@ -818,6 +1037,11 @@ async def ws_session(args):
                             await handle_offer(ws, parsed, args)
             except TimeoutError:
                 pass
+            finally:
+                # Never leave the desktop at a client's resolution after we exit.
+                if UDP is not None and UDP.res_applied and RESOLUTION_CMD is not None:
+                    UDP.reset_session()
+                    await UDP._restore_resolution()
             print("done, close code", ws.close_code)
     except websockets.InvalidStatus as e:
         print("upgrade rejected: HTTP", e.response.status_code, e.response.body[:300])
@@ -844,6 +1068,13 @@ def main():
                                      "(see tools/capture_h264.py); overrides --video")
     w.add_argument("--inject", help="command reading JSON input events on stdin "
                                     "(see tools/inject_input.py)")
+    w.add_argument("--audio",
+                   help="command writing Opus packets as [u32 le len][packet] records "
+                        "(see tools/capture_audio.py); without it no audio is sent")
+    w.add_argument("--resolution-cmd",
+                   help="honour the resolution a client asks for, via this command "
+                        "(see tools/display_mode.py); without it requests are only "
+                        "logged")
     w.add_argument("--fps", type=int, default=30)
     w.add_argument("--size", default="1920x1080", help="WxH advertised in the video header")
     w.add_argument("--big-endian-header", action="store_true",
@@ -862,8 +1093,12 @@ def main():
     if getattr(args, "tx_key", None):
         global TX_KEY, VIDEO_FRAME, VIDEO_FPS, VIDEO_W, VIDEO_H
         global VIDEO_KIND, VIDEO_KIND_P, VIDEO_FLAGS, CAPTURE_CMD, VIDEO_TS
-        global INJECT_CMD
+        global INJECT_CMD, RESOLUTION_CMD, AUDIO_CMD
         TX_KEY = args.tx_key
+        if getattr(args, "audio", None):
+            AUDIO_CMD = shlex.split(args.audio)
+        if getattr(args, "resolution_cmd", None):
+            RESOLUTION_CMD = shlex.split(args.resolution_cmd)
         VIDEO_FPS = args.fps
         VIDEO_W, VIDEO_H = (int(x) for x in args.size.split("x"))
         video.BIG_ENDIAN_HEADER = args.big_endian_header

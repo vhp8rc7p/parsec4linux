@@ -17,7 +17,12 @@ Types observed host->client:
                       probably needs it before it will accept video.
   0x10  blocked flag  {1, 0, 0} = blocked (host window occluded / not capturable),
                       {0, 0, 0} = unblocked. Not sent at all in normal operation.
-  0x15  heartbeat     {1, uptime_ms, stream_index} — every 30 frames.
+  0x15  heartbeat     {1, encode_us, stream_index} — every 30 frames. Field1 is NOT an
+                      uptime: the host sends lrint(encode_ms * 1000.0) (0x1800AA411,
+                      constant 0x408F4000... = 1000.0) and the client stores
+                      field1 / 1000 as that stream's encodeLatency (0x180048A40, case
+                      21). It is what the HUD's "Encode" shows. {2, ..., 0} is the
+                      audio stream's equivalent.
   0x22  frame stats   {0, stream_index, 0} + 16-byte payload: 4 x float32, big-endian
                       (the DLL htonl()s each float's bit pattern). Built in the
                       per-stream loop `sub_1800ABCA0`, once per encoded frame:
@@ -26,8 +31,11 @@ Types observed host->client:
                         [2] encode    ms, frame captured -> encoded; the same value the
                                       host EWMAs into its own `encodeLatency` metric
                         [3] interval  ms since the previous encoded frame
-                      This is what the client's HUD "Encode" reads; without it the
-                      HUD shows n/a. (Long misfiled here as "cursor/stats".)
+                      The client pushes these into a per-stream history ring
+                      (0x180048A40, case 34) -- the performance graphs -- not into
+                      the HUD's number, which comes from the 0x15 heartbeat.
+                      {1, 0, 0} + 12 bytes is the audio version. (Long misfiled
+                      here as "cursor/stats".)
 
 Types observed client->host (see re/NOTES.md): 0x0b config JSON, 0x23, 0x11, 0x0d, 0x03.
 """
@@ -72,9 +80,9 @@ def stream_init(stream_index: int, timestamp: int) -> bytes:
     return build(TYPE_STREAM_INIT, stream_index, timestamp, 0)
 
 
-def heartbeat(uptime_ms: int, stream_index: int) -> bytes:
-    """0x15 — every 30 frames in the DLL."""
-    return build(TYPE_HEARTBEAT, 1, uptime_ms, stream_index)
+def heartbeat(encode_us: int, stream_index: int) -> bytes:
+    """0x15 — every 30 frames: the video encode time the client's HUD shows."""
+    return build(TYPE_HEARTBEAT, 1, encode_us, stream_index)
 
 
 def blocked(is_blocked: bool) -> bytes:

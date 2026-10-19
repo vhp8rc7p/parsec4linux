@@ -23,9 +23,11 @@ typing "abc" produced codes 4, 5, 6 -- SDL scancodes for A, B, C -- each as a
 pressed=1 / pressed=0 pair, with `mod` constant at 0x1000 (SDL's KMOD_NUM, num lock
 on). The layout is {code, mod, pressed} and `mod` is an SDL keymod bitmask.
 
-Wheel (0x02) remains inferred: no session has scrolled yet. `decode()` reports
-`confirmed` per message and the host logs any unconfirmed layout it meets, so a wrong
-guess surfaces in the log instead of silently mis-injecting.
+Wheel (0x02) is {x, y} = {field0, field1}, read from the Windows host's own injector
+(0x18007E230, case 2): field1 goes to SendInput as MOUSEEVENTF_WHEEL and field0 as
+MOUSEEVENTF_HWHEEL, both straight into `mouseData` -- so the units are Windows wheel
+units, 120 per notch, positive = up / right. Confirmed on the wire: the first scroll
+of a real session arrived as fields (0, -120, 0), one notch down.
 
 Coordinate space: absolute motion arrives in **the size we advertise in the video
 frame header**, which is the encode size. Measured in two configurations:
@@ -56,7 +58,7 @@ from . import app
 # --- wire message types (app.py's header, type byte last) --------------------
 TYPE_KEYBOARD = 0x00        # confirmed
 TYPE_MOUSE_BUTTON = 0x01    # confirmed
-TYPE_MOUSE_WHEEL = 0x02     # inferred
+TYPE_MOUSE_WHEEL = 0x02     # confirmed
 TYPE_MOUSE_MOTION = 0x03    # confirmed
 TYPE_GAMEPAD_BUTTON = 0x04  # inferred
 TYPE_GAMEPAD_AXIS = 0x05    # inferred
@@ -66,7 +68,8 @@ TYPE_GAMEPAD_STATE = 0x08   # inferred
 
 INPUT_TYPE_MAX = 0x09       # 0x0a and up is control, see app.py
 
-CONFIRMED = frozenset({TYPE_KEYBOARD, TYPE_MOUSE_BUTTON, TYPE_MOUSE_MOTION})
+CONFIRMED = frozenset({TYPE_KEYBOARD, TYPE_MOUSE_BUTTON, TYPE_MOUSE_MOTION,
+                       TYPE_MOUSE_WHEEL})
 
 # SDL keymod bits, as they arrive in a keyboard message's `mod`.
 KMOD_LSHIFT, KMOD_RSHIFT = 0x0001, 0x0002
@@ -285,10 +288,10 @@ if __name__ == "__main__":
     up = decode(bytes.fromhex("00000004000010000000000000"))
     assert up["code"] == 4 and not up["pressed"], up
 
-    # the wheel layout is still only inferred, and must say so
-    w = decode(build(TYPE_MOUSE_WHEEL, 0, 0xFFFFFFFF, 0))
-    assert w["kind"] == "mouse_wheel" and not w["confirmed"], w
-    assert w["y"] == -1, w
+    # the first real scroll: one notch down, in Windows wheel units
+    w = decode(bytes.fromhex("00000000ffffff880000000002"))
+    assert w["kind"] == "mouse_wheel" and w["confirmed"], w
+    assert (w["x"], w["y"]) == (0, -120), w
 
     # round trip, and negative coordinates for relative mode
     assert decode(mouse_motion(1322, 240))["x"] == 1322
@@ -314,4 +317,4 @@ if __name__ == "__main__":
     assert linux_button(MOUSE_L) == 0x110 and linux_button(MOUSE_R) == 0x111
 
     print(f"input.py self-test OK ({len(_SDL_TO_LINUX)} keycodes, "
-          f"{len(MOUSE_TO_LINUX)} buttons; motion+button+keyboard confirmed on the wire)")
+          f"{len(MOUSE_TO_LINUX)} buttons; motion+button+keyboard+wheel confirmed on the wire)")
