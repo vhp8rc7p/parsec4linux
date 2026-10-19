@@ -18,7 +18,16 @@ Types observed host->client:
   0x10  blocked flag  {1, 0, 0} = blocked (host window occluded / not capturable),
                       {0, 0, 0} = unblocked. Not sent at all in normal operation.
   0x15  heartbeat     {1, uptime_ms, stream_index} — every 30 frames.
-  0x22  cursor/stats  13-byte header + a 16-byte payload of 4 x u32 be.
+  0x22  frame stats   {0, stream_index, 0} + 16-byte payload: 4 x float32, big-endian
+                      (the DLL htonl()s each float's bit pattern). Built in the
+                      per-stream loop `sub_1800ABCA0`, once per encoded frame:
+                        [0] total     ms, start of this loop iteration -> encoded
+                        [1] capture   ms, capture call -> frame in hand
+                        [2] encode    ms, frame captured -> encoded; the same value the
+                                      host EWMAs into its own `encodeLatency` metric
+                        [3] interval  ms since the previous encoded frame
+                      This is what the client's HUD "Encode" reads; without it the
+                      HUD shows n/a. (Long misfiled here as "cursor/stats".)
 
 Types observed client->host (see re/NOTES.md): 0x0b config JSON, 0x23, 0x11, 0x0d, 0x03.
 """
@@ -32,7 +41,8 @@ CONTROL_CHANNEL = 0
 TYPE_STREAM_INIT = 0x1D
 TYPE_BLOCKED = 0x10
 TYPE_HEARTBEAT = 0x15
-TYPE_CURSOR = 0x22
+TYPE_FRAME_STATS = 0x22
+_STATS = struct.Struct("!ffff")
 
 # client -> host, for decoding
 TYPE_CONFIG = 0x0B
@@ -72,6 +82,18 @@ def blocked(is_blocked: bool) -> bytes:
     return build(TYPE_BLOCKED, 1 if is_blocked else 0, 0, 0)
 
 
+def frame_stats(stream_index: int, total_ms: float, capture_ms: float,
+                encode_ms: float, interval_ms: float) -> bytes:
+    """0x22 — per-frame host timings, the source of the client HUD's "Encode"."""
+    return (build(TYPE_FRAME_STATS, 0, stream_index, 0)
+            + _STATS.pack(total_ms, capture_ms, encode_ms, interval_ms))
+
+
+def parse_frame_stats(data: bytes) -> tuple[float, float, float, float]:
+    """Inverse of frame_stats' payload: (total, capture, encode, interval) in ms."""
+    return _STATS.unpack_from(data, HEADER_LEN)
+
+
 if __name__ == "__main__":
     h = stream_init(0, 0x11223344)
     assert len(h) == HEADER_LEN
@@ -86,4 +108,10 @@ if __name__ == "__main__":
     # the captured client config decodes as type 0x0b
     cap = bytes.fromhex("0000015a00000000000000000b")
     assert parse(cap)["type"] == TYPE_CONFIG, parse(cap)
-    print("app.py self-test OK (13-byte header, type last, big-endian fields)")
+    # 0x22: 13 + 16 bytes, stream index in field1, floats big-endian
+    st = frame_stats(0, 9.5, 0.0, 8.25, 33.0)
+    assert len(st) == HEADER_LEN + 16, len(st)
+    assert parse(st)["type"] == TYPE_FRAME_STATS and parse(st)["field1"] == 0
+    assert st[HEADER_LEN + 8:HEADER_LEN + 12] == struct.pack(">f", 8.25)
+    assert parse_frame_stats(st) == (9.5, 0.0, 8.25, 33.0)
+    print("app.py self-test OK (13-byte header, type last, big-endian fields, 0x22 stats)")

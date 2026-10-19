@@ -30,6 +30,7 @@ import stun
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
 from parsec4linux import app, bud, feedback, reliable, video  # noqa: E402
+from parsec4linux import input as pinput  # noqa: E402
 
 # bud_thread emits feedback every 30 ms (DLL 0x18003CC60: `>= 30.0`).
 FEEDBACK_INTERVAL = 0.030
@@ -60,18 +61,24 @@ VIDEO_FLAGS_KEY = 0x21
 VIDEO_FLAGS_FIRST = 0x61
 VIDEO_FLAGS = 0x10
 CAPTURE_CMD = None
+INJECT_CMD = None
 
 # Retransmission (DLL 0x18003C380). We have no RTT measurement yet, so assume a LAN-ish
 # value; the RTO floor of 50 ms dominates anyway.
-# The peer's feedback (its ack) only arrives every ~200 ms under load, so an 80 ms RTO
-# resends everything before its ack can physically arrive. Keep the RTO above that.
+# Initial RTT estimate, used only until the first real sample arrives. RTT is now
+# measured (see _note_rtt), as the DLL does -- it keeps a live value at ctx+0xDD8.
 RTT_MS = 120.0
 MAX_RETX = 10
 # Congestion window: the DLL stops emitting at >= 100 unacked (0x18003C380 `cmp ebp, 64h`).
 CWND = 100
-# Resend only the oldest few per pass. Cumulative acks mean one hole makes everything
-# after it look unacked; blasting all of them is a self-inflicted storm.
-RETX_PER_PASS = 4
+
+# Congestion profiles from the DLL's table at unk_180330D60, float triples indexed by
+# ctx+0xDDC. A message counts as "late" when elapsed > a * rtt + b. The host exports
+# that late count so the encoder can back off at the source instead of discarding
+# frames that were already encoded -- which is what we still do (self.dropped).
+# Profile 0 is (0, 0): everything is immediately late.
+CONGESTION_PROFILES = ((0.0, 0.0), (1.1, 20.0), (1.5, 50.0))
+CONGESTION_PROFILE = 1
 
 API = "https://kessel-api.parsec.app"
 WS = "wss://kessel-ws.parsec.app:443"
@@ -276,6 +283,20 @@ class UdpLogger(asyncio.DatagramProtocol):
         self.retx_total = 0
         self.dropped = 0
         self._t0 = None
+        self.inject = None           # uinput child process
+        self.input_seen = {}
+        self.input_inferred = set()
+        self.motion_extent = [1 << 30, -(1 << 30), 1 << 30, -(1 << 30)]
+        self.cap_size = None         # (w, h) last reported by the capture child
+        self.rtt_ms = None           # measured, smoothed; None until the first sample
+        self.rtt_samples = 0
+        self.rtt_min = self.rtt_max = None
+        self.late = 0                # fragments past the profile's threshold
+        self.imm_acks = 0            # type 0x02
+        self.timer_acks = 0          # type 0x08
+        self.msg_acks_sent = 0       # 0x02s WE sent: the client's only RTT source
+        self.enc_ms = None           # smoothed capture -> encoded, for the log
+        self.frame_interval_ms = 0.0
 
     def reset_session(self):
         """Drop the session so the next datagram rebuilds it from the new attempt's creds.
@@ -295,6 +316,14 @@ class UdpLogger(asyncio.DatagramProtocol):
         self.retx_total = 0
         self.dropped = 0
         self._t0 = None
+        self.cap_size = None
+        self.rtt_ms = None
+        self.rtt_samples = 0
+        self.rtt_min = self.rtt_max = None
+        self.imm_acks = self.timer_acks = 0
+        self.msg_acks_sent = 0
+        self.enc_ms = None
+        self.late = 0
         self.acks = feedback.AckTracker()
         self.reassembler = reliable.Reassembler()
         print("   session reset for new attempt")
@@ -317,6 +346,10 @@ class UdpLogger(asyncio.DatagramProtocol):
         print(f"  (tx key = {TX_KEY})")
         if VIDEO_FRAME is not None or CAPTURE_CMD:
             self.video_task = asyncio.get_running_loop().create_task(self._video_loop())
+        if INJECT_CMD and self.inject is None:
+            # Started once and kept across reconnects: recreating the uinput devices
+            # would make the compositor re-probe them on every attempt.
+            asyncio.get_running_loop().create_task(self._start_inject())
         self.peer = addr
         self.feedback_task = asyncio.get_running_loop().create_task(self._feedback_loop())
         print(f"BUD session up with {addr[0]}:{addr[1]}; feedback every "
@@ -338,25 +371,68 @@ class UdpLogger(asyncio.DatagramProtocol):
                 print("feedback send failed:", e)
                 return
 
-    def _retransmit_due(self, now):
-        """Resend unacked fragments past their RTO, mirroring DLL 0x18003C380.
+    def _release_acked(self, now):
+        """Drop fragments the peer's cumulative acks now cover, and sample RTT.
 
-        rto = clamp(2 * (retx + 1) * rtt, 50 ms, 1000 ms), resend when elapsed > rto + 30 ms.
-        Without this a single lost datagram wedges the client's reader until the next
-        IDR, which is the stutter we saw.
+        Called on every ack packet, not just on the feedback timer, so the send window
+        drains as acks arrive rather than in ~30 ms lumps.
+
+        RTT is sampled only from fragments that were never retransmitted (Karn's
+        algorithm): once a fragment has been sent twice there is no way to tell which
+        copy the ack refers to, and timing it against the latest send systematically
+        underestimates RTT, which shortens the RTO and causes more spurious resends.
         """
         for channel, pending in self.unacked.items():
             acked = self.acks.peer_ack[channel] if channel < feedback.NUM_CHANNELS else 0
             for seq in [s for s in pending if s <= acked]:
-                del pending[seq]  # cumulative ack covers it
-            sent_this_pass = 0
+                _frame, last_sent, retx = pending.pop(seq)
+                if retx == 0:
+                    sample = (now - last_sent) * 1000.0
+                    if 0.0 < sample < 10000.0:
+                        self._note_rtt(sample)
+
+    def _note_rtt(self, sample_ms):
+        """Smooth an RTT sample the way TCP does (alpha 1/8)."""
+        if self.rtt_ms is None:
+            self.rtt_ms = sample_ms
+        else:
+            self.rtt_ms += (sample_ms - self.rtt_ms) / 8.0
+        self.rtt_samples += 1
+        self.rtt_min = sample_ms if self.rtt_min is None else min(self.rtt_min, sample_ms)
+        self.rtt_max = sample_ms if self.rtt_max is None else max(self.rtt_max, sample_ms)
+
+    def _rto_ms(self, retx):
+        """The DLL's own curve (0x18003C380), fed a measured RTT.
+
+        rto = clamp(2 * (retx + 1) * rtt, 50 ms, 1000 ms), resend when elapsed > rto + 30 ms.
+
+        The old 250 ms floor here was a workaround for having no RTT at all: acks only
+        reached us on the 30 ms feedback timer, so a short RTO resent everything before
+        an ack could physically arrive. With measured RTT and 0x02 acks honoured, the
+        DLL's real 50 ms floor is safe.
+        """
+        rtt = self.rtt_ms if self.rtt_ms is not None else RTT_MS
+        return max(50.0, min(1000.0, 2.0 * (retx + 1) * rtt)) + 30.0
+
+    def _retransmit_due(self, now):
+        """Resend unacked fragments past their RTO, mirroring DLL 0x18003C380.
+
+        Without this a single lost datagram wedges the client's reader until the next
+        IDR, which is the stutter we saw.
+        """
+        self._release_acked(now)
+        a, b = CONGESTION_PROFILES[CONGESTION_PROFILE]
+        rtt = self.rtt_ms if self.rtt_ms is not None else RTT_MS
+        late_threshold = a * rtt + b
+        late = 0
+        for channel, pending in self.unacked.items():
+            # The DLL caps work by the congestion window alone, with no per-pass
+            # limit; the window (CWND) already bounds how much can be outstanding.
             for seq, rec in sorted(pending.items()):
-                if sent_this_pass >= RETX_PER_PASS:
-                    break
                 frame, last_sent, retx = rec
-                rto = min(1000.0, 2.0 * (retx + 1) * RTT_MS)
-                rto = max(250.0, rto) + 30.0
-                if (now - last_sent) * 1000.0 <= rto:
+                if retx > 0 or (now - last_sent) * 1000.0 > late_threshold:
+                    late += 1
+                if (now - last_sent) * 1000.0 <= self._rto_ms(retx):
                     continue
                 if retx >= MAX_RETX:
                     del pending[seq]
@@ -366,7 +442,7 @@ class UdpLogger(asyncio.DatagramProtocol):
                                       self.peer)
                 pending[seq] = (frame, now, retx + 1)
                 self.retx_total += 1
-                sent_this_pass += 1
+        self.late = late
 
     def _send_message(self, channel, payload):
         """Fragment one app-level message and put each fragment on the wire.
@@ -397,9 +473,10 @@ class UdpLogger(asyncio.DatagramProtocol):
         return int((time.monotonic() - self._t0) * 1000.0)
 
     def _send_frame(self, frame_no, frame):
+        """Send one encoded frame; False if the congestion window made us drop it."""
         if len(self.unacked[video.PRIMARY_CHANNEL]) >= CWND:
             self.dropped += 1
-            return
+            return False
         key = video.is_keyframe(frame)
         if frame_no == 0:
             flags = VIDEO_FLAGS_FIRST
@@ -407,7 +484,11 @@ class UdpLogger(asyncio.DatagramProtocol):
             flags = VIDEO_FLAGS_KEY
         else:
             flags = VIDEO_FLAGS_DELTA
-        hdr = video.build_raw_header(self._timestamp(frame_no), VIDEO_W, VIDEO_H,
+        # Prefer the size the capture actually reported over the --size default: the
+        # client reads width/height out of every frame header, so telling it the real
+        # encode size is what makes native-resolution and resizing work.
+        w, h = self.cap_size or (VIDEO_W, VIDEO_H)
+        hdr = video.build_raw_header(self._timestamp(frame_no), w, h,
                                      VIDEO_KIND if key else VIDEO_KIND_P, flags)
         payload = hdr + frame
         n = self._send_message(video.PRIMARY_CHANNEL, payload)
@@ -416,6 +497,36 @@ class UdpLogger(asyncio.DatagramProtocol):
             print(f">> video frame {frame_no} ({len(payload)} B, {n} fragments, "
                   f"retx={self.retx_total}, unacked={pend}, dropped={self.dropped}, "
                   f"{'IDR' if key else 'P'})")
+            rtt = (f"{self.rtt_ms:.1f}ms (n={self.rtt_samples}, "
+                   f"{self.rtt_min:.1f}..{self.rtt_max:.1f})"
+                   if self.rtt_ms is not None else "unmeasured")
+            print(f"   rtt={rtt} rto={self._rto_ms(0):.0f}ms "
+                  f"late={self.late} acks: 0x02={self.imm_acks} 0x08={self.timer_acks} "
+                  f"regressions={self.acks.regressions}")
+            if self.input_seen:
+                x0, x1, y0, y1 = self.motion_extent
+                extent = f" motion x {x0}..{x1} y {y0}..{y1}" if x1 >= x0 else ""
+                print(f"   input: {self.input_seen}{extent}")
+            if self.enc_ms is not None:
+                print(f"   encode={self.enc_ms:.1f}ms (smoothed) interval="
+                      f"{self.frame_interval_ms:.1f}ms msg_acks_sent={self.msg_acks_sent}")
+        return True
+
+    def _send_frame_stats(self, encode_ms, interval_ms):
+        """0x22 after each sent frame -- what the client HUD's "Encode" reads.
+
+        The DLL fills four slots; we can only honestly measure two. `encode_ms` is
+        capture -> encoded, measured in the capture child per frame, which is what the
+        DLL puts in slot [2]. It also goes in [0] (total): our capture-to-send path has
+        nothing else that takes measurable time. [1] capture is folded into the encode
+        figure rather than invented, so it is 0.
+        """
+        if encode_ms is None:
+            return
+        self.enc_ms = (encode_ms if self.enc_ms is None
+                       else 0.9 * self.enc_ms + 0.1 * encode_ms)
+        self._send_message(app.CONTROL_CHANNEL,
+                           app.frame_stats(0, encode_ms, 0.0, encode_ms, interval_ms))
 
     async def _video_loop(self):
         """Send video on channel 1, after a 0x1D stream-init on channel 0.
@@ -450,22 +561,47 @@ class UdpLogger(asyncio.DatagramProtocol):
                 return
 
     async def _stream_capture(self):
-        """Read [u32 le length][frame] records from capture_h264.py and forward them."""
+        """Read capture records and forward them.
+
+        Record: [u32 le length][u16 le width][u16 le height][u32 le encode_us][payload].
+        The dimensions ride along with every frame so the video header can carry the
+        true encode size, and so a mid-stream resolution change needs no renegotiation
+        -- which is why Parsec puts width/height in each frame header in the first
+        place. encode_us is that frame's capture -> encoded latency (0 = unknown),
+        forwarded to the client in a 0x22 so its HUD can show it.
+        """
         proc = await asyncio.create_subprocess_exec(
             *CAPTURE_CMD, stdout=asyncio.subprocess.PIPE, stderr=None)
         print(">> capture started:", " ".join(CAPTURE_CMD))
         frame_no = 0
+        last_frame_at = None
         try:
             while True:
-                hdr = await proc.stdout.readexactly(4)
-                size = struct.unpack("<I", hdr)[0]
+                hdr = await proc.stdout.readexactly(12)
+                size, cap_w, cap_h, enc_us = struct.unpack("<IHHI", hdr)
                 if size > 8 << 20:
                     print("capture: implausible frame size", size)
                     return
+                if cap_w and cap_h and (cap_w, cap_h) != (self.cap_size or ()):
+                    if self.cap_size:
+                        print(f">> capture size changed "
+                              f"{self.cap_size[0]}x{self.cap_size[1]} -> "
+                              f"{cap_w}x{cap_h}; the header follows it per frame")
+                    else:
+                        print(f">> capture reports {cap_w}x{cap_h}")
+                    self.cap_size = (cap_w, cap_h)
+                    # The client reports absolute motion in the size we advertise in
+                    # the frame header, so the injector's scaling has to follow it.
+                    self._inject_send({"t": "space", "w": cap_w, "h": cap_h})
                 frame = await proc.stdout.readexactly(size)
                 if self.session is None or self.peer is None:
                     continue  # between attempts; drop rather than queue stale frames
-                self._send_frame(frame_no, frame)
+                now = time.monotonic()
+                interval = 0.0 if last_frame_at is None else (now - last_frame_at) * 1000
+                last_frame_at = now
+                self.frame_interval_ms = interval
+                if self._send_frame(frame_no, frame):
+                    self._send_frame_stats(enc_us / 1000.0 if enc_us else None, interval)
                 frame_no += 1
         except asyncio.IncompleteReadError:
             print("capture ended")
@@ -474,6 +610,75 @@ class UdpLogger(asyncio.DatagramProtocol):
         finally:
             if proc.returncode is None:
                 proc.terminate()
+
+    def _handle_app_message(self, payload):
+        """Route a reassembled app message. Input goes to the uinput child."""
+        if len(payload) < app.HEADER_LEN:
+            return
+        ev = pinput.decode(payload)
+        if ev is None:
+            return  # control message; logged by the caller
+        self.input_seen[ev["kind"]] = self.input_seen.get(ev["kind"], 0) + 1
+        if not ev["confirmed"]:
+            # A layout we inferred rather than measured. Print it once per type so a
+            # wrong guess is visible in the log instead of silently mis-injecting.
+            if ev["kind"] not in self.input_inferred:
+                self.input_inferred.add(ev["kind"])
+                print(f"   !! {ev['kind']} (INFERRED layout) fields={ev['raw']} "
+                      f"decoded={({k: v for k, v in ev.items() if k not in ('raw', 'kind', 'type', 'confirmed')})}")
+        if self.inject is None:
+            return
+        line = None
+        if ev["type"] == pinput.TYPE_MOUSE_MOTION:
+            line = {"t": "motion", "x": ev["x"], "y": ev["y"], "rel": ev["relative"]}
+            self._note_motion(ev["x"], ev["y"])
+        elif ev["type"] == pinput.TYPE_MOUSE_BUTTON:
+            line = {"t": "button", "b": ev["button"], "p": ev["pressed"]}
+        elif ev["type"] == pinput.TYPE_MOUSE_WHEEL:
+            line = {"t": "wheel", "x": ev["x"], "y": ev["y"]}
+        elif ev["type"] == pinput.TYPE_KEYBOARD:
+            line = {"t": "key", "code": ev["code"], "p": ev["pressed"]}
+        if line is None:
+            return
+        self._inject_send(line)
+
+    def _inject_send(self, line):
+        """Write one JSON event to the injector child, if one is running."""
+        if self.inject is None:
+            return
+        try:
+            self.inject.stdin.write((json.dumps(line) + "\n").encode())
+        except Exception as e:
+            print(f"   inject write failed: {e}")
+            self.inject = None
+
+    def _note_motion(self, x, y):
+        """Track the observed coordinate extent.
+
+        Absolute motion arrives in the size we advertise in the video header, which
+        this extent is what established: advertising 1914x884 produced y 0..884,
+        where an earlier session advertising 1920x1080 produced y 0..1077. Keep
+        logging it -- it is the check that the space still tracks the header.
+        """
+        b = self.motion_extent
+        b[0], b[1] = min(b[0], x), max(b[1], x)
+        b[2], b[3] = min(b[2], y), max(b[3], y)
+
+    async def _start_inject(self):
+        if not INJECT_CMD:
+            return
+        try:
+            self.inject = await asyncio.create_subprocess_exec(
+                *INJECT_CMD, stdin=asyncio.subprocess.PIPE, stderr=None)
+            print(">> inject started:", " ".join(INJECT_CMD))
+            # The capture may already have reported its size; the injector starts
+            # with a guess, so hand it the real one rather than waiting for a change.
+            if self.cap_size:
+                self._inject_send({"t": "space",
+                                   "w": self.cap_size[0], "h": self.cap_size[1]})
+        except Exception as e:
+            print(f"!! inject failed to start ({e}); input will be logged only")
+            self.inject = None
 
     def _handle_bud(self, data, addr):
         self._ensure_session(addr)
@@ -487,9 +692,20 @@ class UdpLogger(asyncio.DatagramProtocol):
             return
         msg_type, channel = pt[1], pt[2]
         seq = int.from_bytes(pt[3:7], "big")
-        if msg_type == feedback.TYPE_FEEDBACK:
+        if feedback.is_ack_packet(pt):
+            # Both ack forms carry the same 19-slot vector: 0x08 on a timer, 0x02
+            # immediately for a specific channel/seq. Honouring 0x02 is what lets the
+            # send window drain promptly -- a real client sends thousands of them.
             peer_acks = self.acks.apply_feedback(pt)
-            print(f"BUD << feedback, peer acked {peer_acks[:4]}...")
+            self._release_acked(time.monotonic())
+            if msg_type == feedback.TYPE_MESSAGE_ACK:
+                self.imm_acks += 1
+                if self.imm_acks <= 3 or self.imm_acks % 2000 == 0:
+                    print(f"BUD << 0x02 immediate ack #{self.imm_acks} "
+                          f"(ch={channel} seq={seq}), peer acked {peer_acks[:4]}..., "
+                          f"regressions={self.acks.regressions}")
+            else:
+                self.timer_acks += 1
             return
         self.acks.note_received(channel, seq)
         if msg_type in (reliable.FLAG_LAST, reliable.FLAG_MORE):
@@ -497,9 +713,17 @@ class UdpLogger(asyncio.DatagramProtocol):
             kind = "last" if msg_type == reliable.FLAG_LAST else "more"
             print(f"BUD << reliable ch={channel} seq={seq} ({kind}) pt={len(pt)}")
             if done:
+                # Immediate 0x02 naming this fragment, as the DLL's receive path does on
+                # message completion. It is the client's only RTT sample source; without
+                # it the client's HUD "Network" sits at its 100 ms initial value forever.
+                self.transport.sendto(self.session.encrypt(
+                    feedback.build_message_ack(self.acks.received, channel, seq),
+                    channel=0), self.peer)
+                self.msg_acks_sent += 1
                 ch, dseq, payload = done
                 print(f"   -> message complete ch={ch} seq={dseq} len={len(payload)}: "
                       f"{payload[:48].hex()}")
+                self._handle_app_message(payload)
         else:
             print(f"BUD << type={msg_type:#04x} ch={channel} seq={seq} pt={len(pt)}")
 
@@ -618,6 +842,8 @@ def main():
     w.add_argument("--video", help="Annex-B H.264 file to send repeatedly on channel 1")
     w.add_argument("--capture", help="command emitting [u32le len][frame] records "
                                      "(see tools/capture_h264.py); overrides --video")
+    w.add_argument("--inject", help="command reading JSON input events on stdin "
+                                    "(see tools/inject_input.py)")
     w.add_argument("--fps", type=int, default=30)
     w.add_argument("--size", default="1920x1080", help="WxH advertised in the video header")
     w.add_argument("--big-endian-header", action="store_true",
@@ -636,6 +862,7 @@ def main():
     if getattr(args, "tx_key", None):
         global TX_KEY, VIDEO_FRAME, VIDEO_FPS, VIDEO_W, VIDEO_H
         global VIDEO_KIND, VIDEO_KIND_P, VIDEO_FLAGS, CAPTURE_CMD, VIDEO_TS
+        global INJECT_CMD
         TX_KEY = args.tx_key
         VIDEO_FPS = args.fps
         VIDEO_W, VIDEO_H = (int(x) for x in args.size.split("x"))
@@ -645,6 +872,8 @@ def main():
         VIDEO_TS = args.ts
         if args.capture:
             CAPTURE_CMD = shlex.split(args.capture)
+        if getattr(args, "inject", None):
+            INJECT_CMD = shlex.split(args.inject)
         if args.video:
             with open(args.video, "rb") as f:
                 VIDEO_FRAME = f.read()

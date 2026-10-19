@@ -244,6 +244,58 @@ Caveat: for `type=0x0d` the length field disagreed with the body size in the off
 capture (claims 1–4 bytes, body empty), so either field1/length mean something else for
 that type or those messages are truncated. Not yet understood.
 
+(The `0x03` reading above is superseded: it is mouse motion, and the "0x48d/0x481 in
+field1" was an X coordinate. See the input section below.)
+
+### Client → host INPUT messages – MEASURED 2026-10-19
+
+Settled from our own host's log, not the binary. 987 client→host messages from a real
+Windows client during one live session split **cleanly by type number**:
+
+| type range | meaning | types actually seen |
+|---|---|---|
+| `0x00`–`0x09` | input | `0x01`, `0x03` |
+| `0x0a`+ | control | `0x0a 0x0b 0x0d 0x11 0x15 0x18 0x23` |
+
+The SDK has exactly nine `ParsecMessageType` values (KEYBOARD=1, MOUSE_BUTTON=2,
+MOUSE_WHEEL=3, MOUSE_MOTION=4, GAMEPAD_BUTTON=5, GAMEPAD_AXIS=6, GAMEPAD_UNPLUG=7,
+RELEASE=8, GAMEPAD_STATE=9), and both observed types fit **`wire = SDK − 1`**:
+
+```
+0x01  mouse button   f0 = button (1 = MOUSE_L), f1 = pressed      728 msgs CONFIRMED
+0x03  mouse motion   f0 = relative flag (0 seen), f1 = x, f2 = y   18 msgs CONFIRMED
+0x00  keyboard       f0 = code, f1 = mod, f2 = pressed             INFERRED
+0x02  mouse wheel    f0 = x, f1 = y                                INFERRED
+```
+
+Evidence that these are right: motion's f1/f2 moved monotonically with the pointer,
+and button's f1 toggled 1 then 0 in press/release pairs with f0 always 1 (left). The
+keyboard and wheel layouts are arithmetic from the enum, **not** observed — the
+captured session had no typing and no scrolling. `parsec4linux/input.py` reports
+`confirmed` per message and the host prints any inferred layout it decodes, so a wrong
+guess shows up in the log instead of silently mis-injecting.
+
+**Coordinate space.** Absolute motion spanned x 23..1899, y 0..1077 — the **client's
+own 1920×1080 screen**, not our 1280×720 stream. The client config asks for
+`resolutionX/Y: 0` ("whatever the host has") and we never tell it a resolution, so it
+falls back to its own window space. Rather than negotiate, `tools/inject_input.py`
+sizes the uinput *absolute* axes to that space and lets the compositor map onto the
+real desktop; that also survives a desktop resize. The host logs the running
+coordinate extent so a session either confirms 1920×1080 or reports the real bound.
+
+**Injection.** `uinput` via plain `ioctl` (no deps), two devices, because libinput
+classifies by advertised capabilities and a combined device confuses it:
+`parsec4linux pointer` (ABS_X/ABS_Y + BTN_* + REL_WHEEL/REL_HWHEEL) and
+`parsec4linux keyboard` (all KEY_*). udev tags the pointer `ID_INPUT_MOUSE=1` —
+`udev-builtin-input_id.c` has an explicit branch for "absolute axes, no touch button"
+whose comment names VMware's USB mouse, which is exactly this shape. So it works under
+Wayland, where XTEST does not. It also picks up a `js1` joystick handler, harmless.
+Needs `/dev/uinput` write access (`setfacl -m u:$USER:rw /dev/uinput`).
+
+Keycodes: `ParsecKeycode` mirrors SDL2 `SDL_Scancode`; `input.py` maps 106 of them to
+Linux `KEY_*`. Watch out that SDL letters are alphabetical (A=4..Z=29) while Linux
+codes are QWERTY-ordered, and SDL F11/F12 (68, 69) break the F1–F10 run.
+
 ### Host → client send key – RESOLVED 2026-10-19: ONE shared session key (the answer)
 
 `bud_create` is called **once** with a single `aes256` and all channel contexts share
@@ -503,14 +555,24 @@ live check.
       needed for a first frame are now mapped.
 - [x] **Send a frame** — done, and smooth once the header values were measured.
 - [x] Confirm the video header's byte order live — little-endian.
-- [ ] **Real screen capture.** The pipeline is built and proven with `videotestsrc`;
-      swap to `pipewiresrc` via the ScreenCast portal (`capture_h264.py --source
-      pipewire`, portal code already written). GNOME/Wayland needs an interactive
+- [x] **Real screen capture.** `pipewiresrc` via the ScreenCast portal
+      (`capture_h264.py --source pipewire`). GNOME/Wayland needs an interactive
       "share your screen" approval on the VM's own display the first time;
-      `persist_mode=2` then caches a restore token. **This is the next step.**
-- [ ] Input: decode the client→host input messages (use `parsec_client.py` to watch a
-      real host, then inject with `uinput` — the Windows host's
-      `CreateSyntheticPointerDevice` has no Linux equivalent).
+      `persist_mode=2` then caches a restore token in
+      `~/.config/parsec4linux/portal_token`.
+      Resolution: `videoscale` to a fixed even size means any desktop size works and a
+      live resize does not reinitialise the encoder. Default stretches to fill;
+      `--aspect letterbox` preserves geometry, which needs **both** `add-borders=true`
+      and `pixel-aspect-ratio=1/1` in the output caps — pinning only width/height lets
+      videoscale satisfy them by changing the PAR and letting the decoder stretch it
+      back.
+- [x] Input: decode the client→host input messages. Done, and *not* with
+      `parsec_client.py` — our own host's log of a real client was enough, since input
+      only travels client→host. Mouse motion and buttons confirmed; keyboard and wheel
+      layouts still inferred. Injection via `uinput` as an absolute pointer (the
+      Windows host's `CreateSyntheticPointerDevice` has no Linux equivalent).
+- [ ] Confirm the keyboard (`0x00`) and wheel (`0x02`) field layouts on the wire, and
+      the gamepad types `0x04`–`0x08`.
 - [ ] Audio: channel 2, type `0x01`, ~323 B messages.
 - [ ] Implement BUD type `0x02` per-message acks.
 - [ ] Measure RTT instead of assuming it (retransmit RTO currently hardcodes 120 ms).
@@ -518,4 +580,4 @@ live check.
       **PipeWire via `xdg-desktop-portal` ScreenCast**, not X11/XShm. Needs a portal
       session; a VM/headless GNOME may need remote-desktop portal permissions.
       Software encode (x264/x265) — no GPU encoder in the VM.
-- [ ] Input injection via `uinput`; audio via opus.
+- [x] Input injection via `uinput` (`tools/inject_input.py`). Audio via opus still open.

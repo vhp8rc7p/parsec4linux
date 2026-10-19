@@ -51,6 +51,35 @@ FLAG_BIT_20 = 0x20
 FLAG_BITS_60 = 0x60
 
 
+# Parsec's own host encodes natively and scales only past this, preserving aspect
+# (verified in the host pipeline at 0x1800AF5B0; its hard cap is 0x2000 x 0x10E0).
+MAX_ENCODE_W, MAX_ENCODE_H = 1920, 1080
+HARD_CAP_W, HARD_CAP_H = 0x2000, 0x10E0
+
+
+def encode_size(src_w: int, src_h: int,
+                max_w: int = MAX_ENCODE_W, max_h: int = MAX_ENCODE_H) -> tuple:
+    """Encode size for a source of src_w x src_h, the way Parsec picks one.
+
+    At or under the cap the native size is kept, so no scaler is needed at all. Over
+    it, scale down preserving aspect to fit inside the cap. Either way round *down* to
+    even, because H.264 with I420 chroma subsampling needs even width and height and
+    x264 refuses to initialise otherwise (a 1482x537 desktop hit exactly this).
+
+    Rounding down costs at most one row or column, which is invisible; rescaling to a
+    fixed shape instead visibly squashes the picture, which is what we used to do.
+    """
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError(f"bad source size {src_w}x{src_h}")
+    w, h = src_w, src_h
+    if w > max_w or h > max_h:
+        scale = min(max_w / w, max_h / h)
+        w, h = int(w * scale), int(h * scale)
+    w -= w % 2
+    h -= h % 2
+    return max(2, w), max(2, h)
+
+
 def channel_for_stream(stream_index: int) -> int:
     """Video BUD channel for a stream: 0 -> 1, N -> N + 2."""
     if not 0 <= stream_index < MAX_STREAMS:
@@ -152,6 +181,31 @@ if __name__ == "__main__":
     assert is_keyframe(au)
     # 3-byte start codes too
     assert is_keyframe(bytes.fromhex("00000165"))
+
+    # encode_size: native when it fits, aspect-preserving downscale when it doesn't,
+    # always even.
+    assert encode_size(1920, 1080) == (1920, 1080), "exactly at the cap: unchanged"
+    assert encode_size(1280, 720) == (1280, 720), "under the cap: native"
+    # the real desktops this ran on
+    assert encode_size(1482, 537) == (1482, 536), "odd height rounds down, no scaling"
+    w, h = encode_size(2554, 1367)
+    assert (w, h) == (1920, 1026), (w, h)
+    # aspect preserved to within the even-rounding
+    assert abs((w / h) - (2554 / 1367)) < 0.01, (w / h, 2554 / 1367)
+    assert w % 2 == 0 and h % 2 == 0, (w, h)
+    # a 4K source is bounded by height here, not width
+    assert encode_size(3840, 2160) == (1920, 1080)
+    # odd in both axes
+    assert encode_size(1483, 539) == (1482, 538)
+    # a custom cap still rounds even
+    assert encode_size(1000, 1000, 999, 999) == (998, 998)
+    for bad in ((0, 100), (100, 0), (-1, 5)):
+        try:
+            encode_size(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"encode_size{bad} should reject")
 
     frame = bytes.fromhex("0000000165")  # a plausible H.264 start code + NAL
     pkt = build_packet(1, 640, 480, frame)

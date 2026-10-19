@@ -37,6 +37,14 @@ from __future__ import annotations
 import struct
 
 TYPE_FEEDBACK = 0x08
+# Type 0x02 carries the SAME 19-slot ack vector, but with the header's channel and
+# seq populated rather than zero -- an immediate ack naming what prompted it, instead
+# of the timer-driven 0x08. Established by size: a captured 0x02 was 83 bytes, which
+# is exactly 7 + 19*4, with ch=1 seq=3161 where 0x08 always carries ch=0 seq=0.
+# A real client sent 3839 of these in one session; honouring them releases send-window
+# slots as acks arrive instead of in ~30 ms lumps.
+TYPE_MESSAGE_ACK = 0x02
+ACK_TYPES = (TYPE_FEEDBACK, TYPE_MESSAGE_ACK)
 NUM_CHANNELS = 19  # 0x13, per the bud_thread loop bound
 ENTRY_STRIDE = 12  # 19 * 12 == 0xE4
 PACKET_LEN = 83  # 0x53, the length bud_write_packet hands the sealer
@@ -60,16 +68,44 @@ def build_feedback(acks) -> bytes:
     return packet
 
 
+def build_message_ack(acks, channel: int, seq: int) -> bytes:
+    """Serialize a type-0x02 immediate ack for one received fragment.
+
+    The receive path (DLL 0x18003C760) sends this the moment a reliable message
+    completes, naming the {channel, seq} of the fragment that completed it. On the
+    other side, that pair is the ONLY input to the RTT estimate: the sender looks up
+    the fragment's send time in slot seq % 4000 and folds the sample in as
+    rtt = 0.9*rtt + 0.1*sample. The 19-slot vector rides along but is not applied --
+    cumulative acks still come only from 0x08.
+
+    Which is why the client's HUD showed "Network 100.00ms" against us: its RTT is
+    initialised to 100000 us (`mov [ctx+0DD8h], 186A0h` in 0x18003BB70), and without
+    0x02 acks nothing ever moves it.
+    """
+    pkt = bytearray(build_feedback(acks))
+    pkt[1] = TYPE_MESSAGE_ACK
+    pkt[2] = channel & 0xFF
+    pkt[3:7] = (seq & 0xFFFFFFFF).to_bytes(4, "big")
+    return bytes(pkt)
+
+
+def is_ack_packet(plaintext: bytes) -> bool:
+    """True for either ack form, 0x08 (timer) or 0x02 (immediate)."""
+    return (len(plaintext) == PACKET_LEN and plaintext[0] == 0x01
+            and plaintext[1] in ACK_TYPES)
+
+
 def parse_feedback(plaintext: bytes) -> list[int]:
-    """Parse a received feedback packet -> the peer's per-channel cumulative acks.
+    """Parse a received ack packet -> the peer's per-channel cumulative acks.
 
     Index i is the peer's ack for the messages we sent on channel i, i.e. the value
-    that belongs in our per-channel entry[+4].
+    that belongs in our per-channel entry[+4]. Accepts both 0x08 and 0x02, which share
+    this payload.
     """
     if len(plaintext) != PACKET_LEN:
-        raise ValueError(f"feedback packet must be {PACKET_LEN} bytes, got {len(plaintext)}")
-    if plaintext[0] != 0x01 or plaintext[1] != TYPE_FEEDBACK:
-        raise ValueError(f"not a feedback packet: {plaintext[:2].hex()}")
+        raise ValueError(f"ack packet must be {PACKET_LEN} bytes, got {len(plaintext)}")
+    if plaintext[0] != 0x01 or plaintext[1] not in ACK_TYPES:
+        raise ValueError(f"not an ack packet: {plaintext[:2].hex()}")
     return [struct.unpack_from("!I", plaintext, 7 + 4 * i)[0] for i in range(NUM_CHANNELS)]
 
 
@@ -83,6 +119,7 @@ class AckTracker:
     def __init__(self) -> None:
         self.received = [0] * NUM_CHANNELS  # entry[+0]
         self.peer_ack = [0] * NUM_CHANNELS  # entry[+4]
+        self.regressions = 0  # acks that arrived lower than what we already had
 
     def note_received(self, channel: int, seq: int) -> None:
         """Record that `seq` arrived on `channel`, advancing the cumulative ack."""
@@ -92,7 +129,20 @@ class AckTracker:
             self.received[channel] = seq
 
     def apply_feedback(self, plaintext: bytes) -> list[int]:
-        self.peer_ack = parse_feedback(plaintext)
+        """Merge a received ack packet (0x08 or 0x02) into `peer_ack`.
+
+        Monotonic per channel: a cumulative ack can only move forward. UDP reorders,
+        so a late packet carrying older numbers must not drag the window base back and
+        resurrect slots we already released. `regressions` counts how often that
+        happened, which is also the check on whether reading 0x02's payload as acks is
+        right -- a steady stream of regressions would mean it is not.
+        """
+        incoming = parse_feedback(plaintext)
+        for i, value in enumerate(incoming):
+            if value < self.peer_ack[i]:
+                self.regressions += 1
+            else:
+                self.peer_ack[i] = value
         return self.peer_ack
 
     def feedback_packet(self) -> bytes:
@@ -117,4 +167,36 @@ if __name__ == "__main__":
     assert parse_feedback(t.feedback_packet())[3] == 5
     t.apply_feedback(build_feedback([7] * NUM_CHANNELS))
     assert t.peer_ack[0] == 7
-    print("feedback.py self-test OK (83-byte packet, header, round-trip, tracker)")
+
+    # cumulative acks must never regress: a reordered packet carrying older numbers
+    # must not drag the window base back
+    t.apply_feedback(build_feedback([3] * NUM_CHANNELS))
+    assert t.peer_ack[0] == 7, t.peer_ack[0]
+    assert t.regressions == NUM_CHANNELS, t.regressions
+    # but forward progress still applies, per channel independently
+    mixed = [7] * NUM_CHANNELS
+    mixed[2] = 9
+    t.apply_feedback(build_feedback(mixed))
+    assert t.peer_ack[2] == 9 and t.peer_ack[0] == 7, t.peer_ack[:3]
+
+    # type 0x02 shares the payload, but carries a channel and seq in the header
+    imm = build_message_ack([11] * NUM_CHANNELS, channel=1, seq=3161)
+    assert imm[:7] == bytes.fromhex("01020100000c59"), imm[:7].hex()
+    assert len(imm) == PACKET_LEN
+    assert is_ack_packet(imm) and is_ack_packet(pkt)
+    assert parse_feedback(imm) == [11] * NUM_CHANNELS
+    t.apply_feedback(imm)
+    assert t.peer_ack[0] == 11, t.peer_ack[0]
+
+    # non-ack packets are rejected rather than silently parsed
+    assert not is_ack_packet(bytes.fromhex("012100000000") + bytes(77))
+    assert not is_ack_packet(build_feedback([0] * NUM_CHANNELS)[:-1])
+    for bad in (b"\x01\x21" + bytes(81), bytes(83)):
+        try:
+            parse_feedback(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("should reject a non-ack packet")
+
+    print("feedback.py self-test OK (83-byte packet, 0x08 + 0x02, monotonic tracker)")
